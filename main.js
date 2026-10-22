@@ -226,6 +226,125 @@ btnExportBW.onclick = () => {
   a.href = bwCanvas.toDataURL("image/png"); a.click();
 };
 
+// ── Text wrap ─────────────────────────────────────────────────────────────────
+// Closing punctuation should stay with the previous character when it is easy.
+const NO_LINE_START = new Set(Array.from("，。、；：？！､｡．,.;:?!…—·」』）】》〉)]}”’＂＇％%"));
+const NO_LINE_END   = new Set(Array.from("（【《〈「『([{“‘"));
+
+function isWrapSpace(ch) {
+  return ch === " " || ch === "\t" || ch === "\u3000";
+}
+
+function isLatinWordChar(ch) {
+  return /[A-Za-z0-9]/.test(ch);
+}
+
+/** Wrap one hard line (no newlines) so each visual line fits maxWidth. */
+function wrapHardLine(ctx, text, maxWidth) {
+  if (text === "") return [""];
+  if (ctx.measureText(text).width <= maxWidth) return [text];
+
+  const chars = Array.from(text);
+  const lines = [];
+  let i = 0;
+  while (i < chars.length) {
+    let fit = i;
+    let lo = i + 1;
+    let hi = chars.length;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (ctx.measureText(chars.slice(i, mid).join("")).width <= maxWidth) {
+        fit = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+
+    // One glyph wider than the label: keep it and let the size search shrink.
+    if (fit <= i) {
+      lines.push(chars[i]);
+      i += 1;
+      continue;
+    }
+    if (fit >= chars.length) {
+      lines.push(chars.slice(i).join(""));
+      break;
+    }
+
+    let cut = fit;
+    const next = chars[fit];
+    const prev = chars[fit - 1];
+    if (isLatinWordChar(prev) && isLatinWordChar(next)) {
+      let spaceAt = -1;
+      for (let k = fit - 1; k > i; k--) {
+        if (isWrapSpace(chars[k])) { spaceAt = k; break; }
+      }
+      if (spaceAt > i) cut = spaceAt;
+    } else {
+      if (NO_LINE_START.has(next) && cut - i > 1) cut -= 1;
+      if (cut - i > 1 && NO_LINE_END.has(chars[cut - 1])) cut -= 1;
+    }
+    if (cut <= i) cut = Math.max(fit, i + 1);
+
+    const piece = chars.slice(i, cut).join("").replace(/[ \t\u3000]+$/g, "");
+    if (piece) lines.push(piece);
+    const consumedTo = Math.max(cut, i + 1);
+    i = consumedTo;
+    while (i < chars.length && isWrapSpace(chars[i])) i++;
+    if (i < consumedTo) i = consumedTo;
+  }
+  return lines.length ? lines : [text];
+}
+
+function layoutWrappedLines(ctx, hardLines, maxWidth) {
+  const visual = [];
+  for (const line of hardLines) {
+    for (const part of wrapHardLine(ctx, line, maxWidth)) visual.push(part);
+  }
+  return visual;
+}
+
+function wrappedBlockFits(ctx, visual, fontSize, lhRatio, maxWidth, maxHeight) {
+  if (visual.length * fontSize * lhRatio > maxHeight + 0.01) return false;
+  for (const line of visual) {
+    if (line && ctx.measureText(line).width > maxWidth + 0.5) return false;
+  }
+  return true;
+}
+
+/** Largest integer size in 1..upper whose wrapped lines fit. Does not write the font-size field. */
+function chooseWrappedFontSize(ctx, hardLines, stylePrefix, family, maxWidth, maxHeight, lhRatio, upper) {
+  const limit = Math.max(1, Math.floor(upper));
+  let lo = 1;
+  let hi = limit;
+  let best = 0;
+  let bestLines = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    ctx.font = `${stylePrefix}${mid}px ${family}`;
+    const visual = layoutWrappedLines(ctx, hardLines, maxWidth);
+    if (wrappedBlockFits(ctx, visual, mid, lhRatio, maxWidth, maxHeight)) {
+      best = mid;
+      bestLines = visual;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (!bestLines) {
+    best = 1;
+    ctx.font = `${stylePrefix}1px ${family}`;
+    bestLines = layoutWrappedLines(ctx, hardLines, maxWidth);
+  }
+  ctx.font = `${stylePrefix}${best}px ${family}`;
+  return {
+    fontSize: best,
+    lines: bestLines,
+    fits: wrappedBlockFits(ctx, bestLines, best, lhRatio, maxWidth, maxHeight),
+  };
+}
+
 // ── Draw design canvas ────────────────────────────────────────────────────────
 function drawDesign() {
   const w = parseInt(canvasWidthEl.value) || 240;
@@ -265,30 +384,40 @@ function drawDesign() {
     ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
   }
 
-  const lines = (labelTextEl.value || "").split("\n");
-  const visibleLines = lines.filter(Boolean);
-  if (!visibleLines.length) return;
+  const hardLines = (labelTextEl.value || "").replace(/\r\n?/g, "\n").split("\n");
+  if (!hardLines.some(line => line.length > 0)) return;
 
   const family      = fontFamilyEl.value || "sans-serif";
   const lhRatio     = parseFloat(lineHeightEl.value) || 1.2;
-  const manualSize  = parseInt(fontSizeEl.value);
+  const typedSize   = parseInt(fontSizeEl.value, 10);
   const padding     = 8;
   const stylePrefix = `${isItalic ? "italic " : ""}${isBold ? "bold " : ""}`;
   // For 90°/270°, available text space swaps axes
   const rotated     = textRotation === 90 || textRotation === 270;
   const effW        = rotated ? h : w;
   const effH        = rotated ? w : h;
+  const maxWidth    = Math.max(1, effW - padding * 2);
+  const maxHeight   = Math.max(1, effH - padding * 2);
+  // 極簡模式只為這次繪圖自動縮放，不改一般模式裡記住的字體大小。
+  const mini        = document.documentElement.classList.contains("mode-mini");
+  const useAuto     = mini || !(typedSize > 0);
 
   let fontSize;
-  if (manualSize > 0) {
-    fontSize = manualSize;
+  let visualLines;
+  let fits;
+  if (useAuto) {
+    const fitted = chooseWrappedFontSize(
+      ctx, hardLines, stylePrefix, family, maxWidth, maxHeight, lhRatio, maxHeight / lhRatio
+    );
+    fontSize = fitted.fontSize;
+    visualLines = fitted.lines;
+    fits = fitted.fits;
   } else {
-    fontSize = Math.floor((effH - padding * 2) / (visibleLines.length * lhRatio));
-    fontSize = Math.min(fontSize, effH - padding * 2);
+    // 一般模式的手動字級：先用這個大小換行，高度塞不下才整塊縮小。
+    fontSize = typedSize;
     ctx.font = `${stylePrefix}${fontSize}px ${family}`;
-    const maxW = Math.max(...visibleLines.map(l => ctx.measureText(l).width));
-    if (maxW > effW - padding * 2) fontSize = Math.floor(fontSize * (effW - padding * 2) / maxW);
-    fontSize = Math.max(fontSize, 6);
+    visualLines = layoutWrappedLines(ctx, hardLines, maxWidth);
+    fits = wrappedBlockFits(ctx, visualLines, fontSize, lhRatio, maxWidth, maxHeight);
   }
 
   ctx.save();
@@ -300,12 +429,24 @@ function drawDesign() {
   ctx.textAlign    = textAlign;
 
   const lineH  = fontSize * lhRatio;
-  const totalH = lineH * visibleLines.length;
+  let totalH   = lineH * visualLines.length;
+  let maxLineW = 0;
+  for (const line of visualLines) {
+    if (line) maxLineW = Math.max(maxLineW, ctx.measureText(line).width);
+  }
+  // Last resort so a huge block is scaled down instead of clipped.
+  let fitScale = 1;
+  if (!fits) {
+    if (totalH > maxHeight) fitScale = Math.min(fitScale, maxHeight / totalH);
+    if (maxLineW > maxWidth) fitScale = Math.min(fitScale, maxWidth / maxLineW);
+  }
+  if (fitScale < 1) ctx.scale(fitScale, fitScale);
+
   const startY = -totalH / 2 + lineH / 2;
   const xBase  = textAlign === "left"  ? -effW / 2 + padding :
                  textAlign === "right" ?  effW / 2 - padding : 0;
 
-  visibleLines.forEach((line, i) => ctx.fillText(line, xBase, startY + i * lineH));
+  visualLines.forEach((line, i) => ctx.fillText(line, xBase, startY + i * lineH));
   ctx.restore();
 }
 
@@ -1148,6 +1289,7 @@ function setMode(mode) {
   try { localStorage.setItem(MODE_KEY, mini ? "mini" : "full"); }
   catch { /* 寫不進去時，這次畫面仍然切換 */ }
   stopVoice();
+  repaintAll();
 }
 
 function syncModeButton() {
