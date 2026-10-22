@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Vite build output & cache
+dist/
+.vite/
+*.local
+
+# Old/duplicate setup script (superseded by setup-local-libs.cjs)
+setup-local-libs.js
+
+# niimbluelib is a separate repo — clone it manually:
+#   git clone https://github.com/MultiMote/niimbluelib.git niimbluelib
+niimbluelib/

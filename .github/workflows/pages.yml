@@ -1,0 +1,36 @@
+name: 發布到 GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 收集靜態檔
+        run: |
+          mkdir -p _site/lib _site/icons
+          # docs/ 的說明截圖只留在倉庫，給 README 顯示，不要放進網站。
+          cp index.html main.js styles.css .nojekyll manifest.webmanifest sw.js _site/
+          cp lib/*.js _site/lib/
+          cp icons/*.png _site/icons/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
